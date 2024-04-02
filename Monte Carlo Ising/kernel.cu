@@ -7,45 +7,40 @@
 
 #include <curand_kernel.h>
 
-const int rows = 128; 
-const int cols = 128; 
-const int numThreadsPerBlockX = 8;
-const int numThreadsPerBlockY = 8;
-
-const int numBlocksX = cols / numThreadsPerBlockX;
-const int numBlocksY = rows  / numThreadsPerBlockY;
+const int size = 128; 
 const float temperature_max = 10.0;
 const float temperature_min = 0.01;
 
 // Function to initialize the 2D spin configuration
-void initializeSpins(int *spins, int rows, int cols) {
+void initializeSpins(int *spins, int size) {
     std::mt19937 rng(std::time(0));
     std::uniform_int_distribution<int> distribution(0, 1);
 
-    for (int i = 0; i < rows; ++i) {
-        for (int j = 0; j < cols; ++j) {
-            spins[i * cols + j] = 2*distribution(rng)-1; 
+    for (int i = 0; i < size; ++i) {
+        for (int j = 0; j < size; ++j) {
+            spins[i * size + j] = 2*distribution(rng)-1; 
         }
     }
 }
 
-__global__ void updateSpins2D(int *spins, float *randNums, int rows, int cols, float temperature, float J) {
+__global__ void updateSpins2D(int *spins, int size, float temperature, float J) {
     curandState state;
-    curand_init(clock64(), blockIdx.x*blockDim.x+threadIdx.x, threadIdx.x+threadIdx.y, &state);
+    curand_init(clock64(), blockIdx.x*blockDim.x+threadIdx.x, blockIdx.y*blockDim.y+threadIdx.y, &state);
 
-    int row = curand(&state) % rows;
-    int col = curand(&state) % cols;
+    int row = (blockIdx.x*blockDim.x+threadIdx.x + curand(&state)) % size;
+    int col = (blockIdx.y*blockDim.y+threadIdx.y + curand(&state)) % size;
 
+    float p = (float)curand(&state) / (float)UINT_MAX;
         // Perform Metropolis algorithm
-        int idx = row * cols + col;
-        int neighbors = spins[((row + 1) % rows) * cols + col] +
-                        spins[((row - 1 + rows) % rows) * cols + col] +
-                        spins[row * cols + (col + 1) % cols] +
-                        spins[row * cols + (col - 1 + cols) % cols];
+        int idx = row * size + col;
+        int neighbors = spins[((row + 1) % size) * size + col] +
+                        spins[((row - 1 + size) % size) * size + col] +
+                        spins[row * size + (col + 1) % size] +
+                        spins[row * size + (col - 1 + size) % size];
 
         float deltaE = 2.0* J * spins[idx] * neighbors;
 
-        if (deltaE < 0.0f || randNums[idx] < exp(-deltaE / temperature)) 
+        if (deltaE < 0.0f || p < exp(-deltaE / temperature)) 
             spins[idx] *= -1;  // Flip the spin
 }
 
@@ -104,9 +99,15 @@ double temperature_slider(double temperature, int X, int Y)
 }
 
 int main() {
+    int max_threads;
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0); // Assumes device 0
+    cudaDeviceGetAttribute(&max_threads, cudaDevAttrMaxThreadsPerBlock, 0);
+    int threads = sqrt(max_threads);
+    int blocks = size / threads + (size % threads != 0);
+    dim3 gridSize(blocks, blocks);
+    dim3 blockSize(threads, threads);
 
-    dim3 blocks(numBlocksX, numBlocksY);
-    dim3 threads(numThreadsPerBlockX, numThreadsPerBlockY);
     float temperature = 1.0 ;
     float J = 1.0; 
     int *spins;
@@ -116,8 +117,8 @@ int main() {
     int screenHeight = 800;
     int displayWidth = 1024;
     int displayHeight = 750;
-    int rectWidth = displayWidth / cols;
-    int rectHeight = displayHeight / rows;
+    int rectWidth = displayWidth / size;
+    int rectHeight = displayHeight / size;
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -126,44 +127,37 @@ int main() {
     InitWindow(screenWidth, screenHeight, "2D Ising Model Visualization");
     SetTargetFPS(30);
     // Allocate memory on the CPU
-    spins = new int[rows * cols];
-    randNums = new float[rows * cols];
+    spins = new int[size* size];
+    randNums = new float[size*size];
 
     // Allocate memory on the GPU
     int *dev_spins;
     float *dev_randNums;
 
-    cudaMalloc((void**)&dev_spins, rows * cols * sizeof(int));
-    cudaMalloc((void**)&dev_randNums, rows * cols * sizeof(float));
+    cudaMalloc((void**)&dev_spins, size * size * sizeof(int));
+    cudaMalloc((void**)&dev_randNums, size * size * sizeof(float));
 
     // Initialize 2D spin configuration on the CPU
-    initializeSpins(spins, rows, cols);
+    initializeSpins(spins, size);
 
     // Copy data from CPU to GPU
-    cudaMemcpy(dev_spins, spins, rows * cols * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_spins, spins, size * size * sizeof(int), cudaMemcpyHostToDevice);
 
     // Main simulation loop
     while (!WindowShouldClose()) {
-        // Generate random numbers on the CPU and copy to GPU
-        for (int i = 0; i < rows * cols; i++) {
-            randNums[i] = dis(gen);
-        }
-        
-        cudaMemcpy(dev_randNums, randNums, rows * cols * sizeof(float), cudaMemcpyHostToDevice);
 
-       // for (int i = 0; i < 100; i++) {
-            updateSpins2D<<<blocks, threads>>>(dev_spins, dev_randNums, rows, cols, temperature, J);
-            cudaDeviceSynchronize();
-        //}
+        updateSpins2D<<<gridSize, blockSize>>>(dev_spins, size, temperature, J);
+        cudaDeviceSynchronize();
+
         // Copy data from GPU to CPU for visualization
-        cudaMemcpy(spins, dev_spins, rows * cols * sizeof(int), cudaMemcpyDeviceToHost);
-
+        cudaMemcpy(spins, dev_spins, size * size * sizeof(int), cudaMemcpyDeviceToHost);
+ 
         BeginDrawing();
         ClearBackground(RAYWHITE);
 
-        for (int i = 0; i < rows; i++) {
-            for (int j = 0; j < cols; j++) {
-                int idx = i * cols + j;
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++) {
+                int idx = i * size + j;
                 Color color = ((spins[idx] == 1) ? RED : BLUE);
                 DrawRectangle(j * rectWidth, i * rectHeight, rectWidth, rectHeight, color);
             }
@@ -171,8 +165,8 @@ int main() {
         
         if (reset_button(displayWidth / 10, displayHeight - 80) || IsKeyPressed(KEY_R))
         {
-            initializeSpins(spins, rows, cols);
-            cudaMemcpy(dev_spins, spins, rows * cols * sizeof(int), cudaMemcpyHostToDevice);
+            initializeSpins(spins, size);
+            cudaMemcpy(dev_spins, spins, size * size * sizeof(int), cudaMemcpyHostToDevice);
         }
         if (j_button(J,4*displayWidth/10, displayHeight - 80 ) || IsKeyPressed(KEY_J)) J *= -1.0;
         temperature = temperature_slider(temperature, 7*displayWidth/10, displayHeight - 80);
